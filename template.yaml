@@ -1,0 +1,248 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+
+Globals:
+  Function:
+    Timeout: 240
+    Runtime: python3.12
+    Architectures:
+      - x86_64
+    MemorySize: 4096
+    EphemeralStorage:
+      Size: 4096
+
+Resources:
+  ## S3 Buckets
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: video-frame-splitter-source-bucket
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  FrameOutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: video-frame-splitter-output-bucket
+
+  ## Layer
+  FfmpegLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: video-frame-splitter-ffmpeg-layer
+      ContentUri: ./layers/ffmpeg/
+      CompatibleArchitectures:
+        - x86_64
+      CompatibleRuntimes:
+        - python3.12
+    Metadata:
+      BuildMethod: python3.12
+
+  ## Lambda: 動画長さ取得
+  VideoFrameSplitterGetVideoDurationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: video-frame-splitter-get-video-duration
+      CodeUri: functions/get_video_duration/
+      Handler: app.lambda_handler
+      Layers:
+        - !Ref FfmpegLayer
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref SourceBucket
+
+  ## Lambda: フレーム抽出
+  VideoFrameSplitterExtractFrameFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: video-frame-splitter-extract-frame
+      CodeUri: functions/extract_frame/
+      Handler: app.lambda_handler
+      Layers:
+        - !Ref FfmpegLayer
+      Environment:
+        Variables:
+          OUTPUT_BUCKET: !Ref FrameOutputBucket
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref SourceBucket
+        - S3WritePolicy:
+            BucketName: !Ref FrameOutputBucket
+
+  ## CloudWatch LogGroup for Step Functions
+  VideoFrameSplitterLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: /aws/videoframesplitter/statemachine
+      RetentionInDays: 14
+
+  ## Step Functions Express Workflow
+  VideoFrameSplitterStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: video-frame-splitter-sm
+      Type: EXPRESS
+      Role: !GetAtt VideoFrameSplitterStateMachineRole.Arn
+      Definition:
+        StartAt: GetVideoDuration
+        States:
+          GetVideoDuration:
+            Type: Task
+            Resource: !GetAtt VideoFrameSplitterGetVideoDurationFunction.Arn
+            Next: GenerateFrameList
+            QueryLanguage: JSONata
+            Assign:
+              bucket: "{% $states.result.bucket %}"
+              key: "{% $states.result.key %}"
+              fps: "{% $states.result.fps %}"
+          GenerateFrameList:
+            Type: Pass
+            Next: ExtractFrames
+            QueryLanguage: JSONata
+            Output:
+              snapshotTimes: "{% $range(0, $states.input.duration, 1) %}"
+          ExtractFrames:
+            Type: Map
+            End: true
+            QueryLanguage: JSONata
+            Items: "{% $states.input.snapshotTimes %}"
+            ItemProcessor:
+              StartAt: ExtractFrame
+              States:
+                ExtractFrame:
+                  Type: Task
+                  Resource: !GetAtt VideoFrameSplitterExtractFrameFunction.Arn
+                  End: true
+                  QueryLanguage: JSONata
+                  Arguments:
+                    bucket: "{% $bucket %}"
+                    key: "{% $key %}"
+                    second: "{% $states.input %}"
+                    fps: "{% $fps %}"
+      Logging:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt VideoFrameSplitterLogGroup.Arn
+
+  ## IAMロール（StateMachine実行用）
+  VideoFrameSplitterStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - states.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "InvokeLambdaFunctions"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: "*"
+        - PolicyName: "AllowLogDeliveryActions"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+  
+  VideoFrameSplitterLogsResourcePolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: allow-sfn-log-delivery
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "AWSLogDeliveryWrite",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "delivery.logs.amazonaws.com"
+              },
+              "Action": [
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+              ],
+              "Resource": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/vendedlogs/states/*:*"
+            }
+          ]
+        }
+
+
+  ## EventBridge IAMロール
+  VideoFrameSplitterEventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: video-frame-splitter-eventbridge-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "AllowStartExecutionOnStateMachine"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref VideoFrameSplitterStateMachine
+
+  ## EventBridgeルール: S3アップロードトリガー
+  StartVideoFrameSplitterStateMachineRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: video-frame-splitter-trigger-rule
+      Description: "Trigger StateMachine on S3 upload"
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - "Object Created"
+        detail:
+          bucket:
+            name:
+              - !Ref SourceBucket
+      Targets:
+        - Arn: !Ref VideoFrameSplitterStateMachine
+          Id: "TargetStepFunctions"
+          RoleArn: !GetAtt VideoFrameSplitterEventBridgeRole.Arn
+      State: ENABLED
+
+Outputs:
+  SourceBucketName:
+    Description: "動画アップロード用バケット"
+    Value: !Ref SourceBucket
+
+  FrameOutputBucketName:
+    Description: "サムネイル保存バケット"
+    Value: !Ref FrameOutputBucket
+
+  VideoFrameSplitterStateMachineArn:
+    Description: "StateMachineのARN"
+    Value: !Ref VideoFrameSplitterStateMachine
