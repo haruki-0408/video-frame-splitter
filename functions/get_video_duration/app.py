@@ -35,8 +35,8 @@ def lambda_handler(event, context):
         metadata = json.loads(result.stdout)
         duration = float(metadata['format']['duration'])
         video_stream = next((stream for stream in metadata['streams'] if stream.get('codec_type') == 'video'), None)
-        if video_stream is None:
-            raise Exception("動画ストリームが見つかりません")
+        
+    
         r_frame_rate = video_stream.get('r_frame_rate', '0/1')
         numerator, denominator = map(int, r_frame_rate.split('/'))
         fps = round(numerator / denominator) if denominator != 0 else 0
